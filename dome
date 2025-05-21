@@ -45,7 +45,7 @@ class CarController:
         self.max_speed = 5.0
         # 基础加速度 (用于手动控制，作为期望加速度的参考) - Note: MPC uses max_accel
         # Base acceleration (for manual control, as reference for desired acceleration) - Note: MPC uses max_accel
-        self.acceleration = 3.0
+        self.acceleration = 3.0 # This parameter is not currently used by the MPC logic, which commands acceleration directly
         self.trajectory = []
 
         # *** 添加阻力参数 ***
@@ -58,7 +58,7 @@ class CarController:
         # MPC parameters
         # MPC 采样时间 (Note: This is different from actual frame dt)
         # MPC sampling time (Note: This is different from actual frame dt)
-        self.dt = 0.10
+        self.dt = 0.10 # MPC planning step time
         # 预测步数
         # Prediction horizon
         self.prediction_horizon = 5
@@ -70,9 +70,12 @@ class CarController:
         self.weight_goal = 10.0
         # 速度匹配权重（可选，让车倾向于达到一定速度，与手动方向相关）
         # Velocity matching weight (optional, makes the car tend towards a certain speed related to manual direction)
-        self.weight_velocity = 5.0
+        self.weight_velocity = 5.0 # Weight for velocity tracking in manual mode
         # 加速度（控制量）权重
         # Acceleration (control input) weight
+        # Keep weight_accel relatively low compared to velocity or goal weights
+        # A very low weight_accel can improve responsiveness but may lead to shaky control
+        # 0.1 is a reasonable starting point.
         self.weight_accel = 0.1
         # 障碍物权重
         # Obstacle weight
@@ -108,7 +111,7 @@ class CarController:
         self.blend_safe_dist = self.car_radius + self.obstacle_visual_radius + self.avoidance_margin
         # 离障碍物远于此距离时，完全优先目标/手动控制
         # When farther than this distance from an obstacle, full priority to goal/manual control
-        self.manual_override_dist = self.blend_safe_dist + 3.0
+        self.manual_override_dist = self.blend_safe_dist + 3.0 # Increased blend range slightly
         # 当前帧的混合比例 (1: 纯避障, 0: 纯目标/手动)
         # Current frame's blend ratio (1: pure avoidance, 0: pure goal/manual)
         self.blend_alpha = 0.0
@@ -120,10 +123,10 @@ class CarController:
         self.radar_max_distance = 15.0
         # 雷达角度分辨率 (度)
         # Radar angle resolution (degrees)
-        self.radar_angle_res = 0.1
+        self.radar_angle_res = 1 # Slightly coarser resolution for speed
         # 雷达距离测量噪声标准差
         # Radar distance measurement noise standard deviation
-        self.radar_noise_std = 0.05
+        self.radar_noise_std = 0.1
         # 存储 (angle_deg, distance) 列表
         # Store (angle_deg, distance) list
         self.raw_scan_data = []
@@ -192,17 +195,22 @@ class CarController:
         # 计时器用于控制更新频率
         # Timer for controlling update frequency
         self._last_time = time.time()
+        self._current_frame_dt = 0.0 # To store actual dt for display
 
         # 使用动画进行更平滑的更新
         # Use animation for smoother updates
         from matplotlib.animation import FuncAnimation
         # blit=False is simpler if artists are not tracked explicitly
-        self.ani = FuncAnimation(self.fig, self.update_frame, frames=None, interval=30, blit=False, repeat=False)
+        # interval=30ms means target 33 FPS. Lowering interval increases target FPS, but requires update_frame to be fast enough
+        self.ani = FuncAnimation(self.fig, self.update_frame, frames=None, interval=30, blit=False, repeat=False) # Adjusted interval to 30ms
 
         print(f"MPC blend parameters: safe_dist={self.blend_safe_dist:.2f}m, override_dist={self.manual_override_dist:.2f}m")
         print(f"Collision/MPC avoidance minimum distance: {self.car_radius + self.obstacle_visual_radius + self.avoidance_margin:.2f}m")
         print(f"Boundary safe distance: {self.boundary_safe_distance:.2f}m")
         print(f"Resistance coefficient: {self.resistance_coeff}")
+        print(f"MPC Prediction Horizon: {self.prediction_horizon} steps ({self.prediction_horizon * self.dt:.2f} seconds)")
+        print(f"MPC Optimizer Max Iterations (SLSQP): 200") # *** FIX: Increased maxiter ***
+
 
     def setup_plot(self):
         """初始化绘图区域"""
@@ -247,6 +255,8 @@ class CarController:
             # Remove space from set so we don't process other keys simultaneously (optional, but makes space a dedicated stop)
             self._pressed_keys.discard(' ')
             self._pressed_keys.discard('space')
+            self.goal = None # Clear goal on emergency stop
+            self.goal_marker.set_data([], [])
             return
 
         if 'w' in self._pressed_keys or 'up' in self._pressed_keys:    vec += [0, 1]
@@ -272,13 +282,16 @@ class CarController:
             print(f"Goal set to: {self.goal}")
             # 当设置新目标时，清除手动控制方向并停止车辆以便MPC接管
             # When setting a new goal, clear manual control direction and stop the vehicle for MPC takeover
+            # Clear manual control input keys
             if hasattr(self, '_pressed_keys'):
                 self._pressed_keys = set()
             self.control_vector = np.array([0.0, 0.0])
             # Stop vehicle to clearly show MPC starting from rest towards new goal
-            self.vx = 0.0
-            self.vy = 0.0
-            self.velocity = 0.0
+            # Commenting out stopping on goal click to allow smooth transition
+            # self.vx = 0.0
+            # self.vy = 0.0
+            # self.velocity = 0.0
+
 
     def init_obstacles(self):
         """初始化6个动态障碍物 (真实的模拟对象)"""
@@ -300,15 +313,21 @@ class CarController:
                 motion_type = 'circle'
                 angle = random.uniform(0, 2*math.pi)
                 radius = random.uniform(4, 8)
+                # Ensure initial position is not too close to car origin (0,0)
+                while np.linalg.norm([radius * math.cos(angle), radius * math.sin(angle)]) < 3.0:
+                    angle = random.uniform(0, 2*math.pi)
+                    radius = random.uniform(4, 8)
+
                 cx = radius * math.cos(angle)
                 cy = radius * math.sin(angle)
+
 
                 obstacle = {
                     'id': obstacle_id_counter,
                     'circle': plt.Circle((cx, cy), true_obstacle_radius, color='darkorange', alpha=0.8, zorder=3),
                     'motion_type': motion_type,
                     # Angular speed (rad/s) - Let's use speed for linear component for simplicity consistent with linear type
-                    'speed': speed,
+                    'speed': speed, # This is intended linear speed (m/s) along the circumference
                     # Current angle
                     'angle': angle,
                     # Radius of circular path
@@ -316,8 +335,6 @@ class CarController:
                     # Store true radius
                     'true_radius': true_obstacle_radius
                 }
-                # Calculate linear speed for circular motion visualization consistency
-                obstacle['linear_speed'] = speed * radius # m/s
 
                 self.ax.add_patch(obstacle['circle'])
                 self._obstacle_patches.append(obstacle['circle'])
@@ -326,6 +343,12 @@ class CarController:
                 motion_type = 'linear'
                 cx = random.uniform(-self.world_size + true_obstacle_radius, self.world_size - true_obstacle_radius)
                 cy = random.uniform(-self.world_size + true_obstacle_radius, self.world_size - true_obstacle_radius)
+
+                # Ensure initial position is not too close to car origin (0,0)
+                while np.linalg.norm([cx, cy]) < 3.0:
+                    cx = random.uniform(-self.world_size + true_obstacle_radius, self.world_size - true_obstacle_radius)
+                    cy = random.uniform(-self.world_size + true_obstacle_radius, self.world_size - true_obstacle_radius)
+
 
                 target_x = random.uniform(-self.world_size + true_obstacle_radius, self.world_size - true_obstacle_radius)
                 target_y = random.uniform(-self.world_size + true_obstacle_radius, self.world_size - true_obstacle_radius)
@@ -347,6 +370,7 @@ class CarController:
 
         print(f"Initialized {len(self.obstacles)} simulation obstacles.")
 
+
     def ray_intersect_circle(self, origin, theta_rad, circle_center_pos, circle_radius):
         """射线与圆求交。返回交点在射线上的参数 t (距离)，如果无交点或交点在射线反方向则返回None。"""
         # Calculates intersection of a ray with a circle. Returns parameter t (distance) along the ray, or None if no intersection or intersection is behind the ray origin.
@@ -358,33 +382,36 @@ class CarController:
         fy = oy - cy
         r = circle_radius
 
-        A = dx*dx + dy*dy
+        A = dx*dx + dy*dy # Should be 1 if dx, dy are from a unit vector, but calculated this way is robust
         B = 2 * (fx * dx + fy * dy)
         C = fx * fx + fy * fy - r * r
 
         delta = B * B - 4 * A * C
 
         if delta < 0:
-            return None
+            return None # No real intersection
 
         sqrt_delta = math.sqrt(delta)
 
-        if abs(A) < 1e-9: return None
+        # Handle case where ray might start inside the circle.
+        # t represents the distance along the ray. We want t >= 0.
+        # If the origin is inside, one solution for t will be negative and one positive.
+        # We need the smallest NON-NEGATIVE t.
+        # (Note: Ray starts AT the origin, so t=0 is the origin itself. Intersection must be strictly beyond origin for a detection.)
 
         t1 = (-B - sqrt_delta) / (2 * A)
         t2 = (-B + sqrt_delta) / (2 * A)
 
-        positive_ts = [t for t in [t1, t2] if t >= -1e-9]
+        # Get the smallest positive t value
+        positive_ts = [t for t in [t1, t2] if t > 1e-9] # Use a small epsilon to avoid detecting collision at the origin point
 
         if not positive_ts:
-            return None
+            return None # No intersection in front of the ray origin
 
         min_t = min(positive_ts)
 
-        # Add a small tolerance to avoid detecting collision point as inside/at origin
-        # if min_t < 1e-6: return None # This check might be too aggressive, let's trust the math for t>=0
-
         return min_t
+
 
     def scan_environment(self):
         """模拟角度-距离雷达扫描环境。返回(角度(度), 距离)的列表。"""
@@ -392,9 +419,11 @@ class CarController:
         self.raw_scan_data = []
         origin = (self.x, self.y)
 
+        # Radar scans relative to the car's orientation self.theta
         car_orientation_rad = math.radians(self.theta)
 
         for angle_deg_relative in np.arange(0, 360, self.radar_angle_res):
+            # Convert relative angle to world angle based on car's orientation
             angle_rad_world = car_orientation_rad + math.radians(angle_deg_relative)
 
             closest_dist = self.radar_max_distance
@@ -403,23 +432,33 @@ class CarController:
             # 寻找这条射线与所有真实障碍物的最近交点距离
             # Find the nearest intersection distance of this ray with all true obstacles
             for obstacle in self.obstacles:
-                # Use true radius
+                # Use true radius for detection
                 t = self.ray_intersect_circle(origin, angle_rad_world, obstacle['circle'].center, obstacle['true_radius'])
 
+                # Only consider hits within max distance
                 if t is not None and t < closest_dist:
                     closest_dist = t
                     hit_found = True
 
-            # If found a hit, record noisy distance measurement
+            # If found a hit within max distance, record noisy distance measurement
             if hit_found:
+                # Add noise to the measured distance
                 noisy_dist = closest_dist + random.gauss(0, self.radar_noise_std)
-                noisy_dist = max(0.1, noisy_dist)
-                noisy_dist = min(noisy_dist, self.radar_max_distance + self.radar_noise_std * 3)
-                self.raw_scan_data.append((angle_deg_relative, noisy_dist))
+                # Ensure distance is non-negative and within a reasonable range
+                noisy_dist = max(0.0, noisy_dist)
+                # Cap noisy distance, but allow slightly beyond max_distance due to noise
+                noisy_dist = min(noisy_dist, self.radar_max_distance + self.radar_noise_std * 3) # Allow noise to slightly exceed max range
+
+                # Only add points within the nominal max radar distance for clustering/processing
+                # Points slightly beyond max_distance due to noise are filtered here before clustering
+                if noisy_dist <= self.radar_max_distance:
+                    self.raw_scan_data.append((angle_deg_relative, noisy_dist))
+
 
     def convert_polar_to_cartesian(self, angle_deg_relative, distance, car_x, car_y, car_theta_deg):
         """将相对于小车的极坐标点 (角度(度), 距离) 转换为世界坐标系的 (x, y)。"""
         # Converts a polar point (angle_deg, distance) relative to the car to world coordinates (x, y).
+        # Use car's orientation to convert relative angle to world angle
         car_theta_rad = math.radians(car_theta_deg)
         angle_rad_relative = math.radians(angle_deg_relative)
 
@@ -429,6 +468,7 @@ class CarController:
         world_y = car_y + distance * math.sin(angle_rad_world)
         return (world_x, world_y)
 
+
     def cluster_scan_points(self):
         """将原始雷达数据 (角度, 距离) 转换为世界坐标 (x, y) 点，并进行聚类。"""
         # Converts raw radar data (angle, distance) to world coordinates (x, y) points and performs clustering.
@@ -437,183 +477,191 @@ class CarController:
             self.scan_points_for_plot = np.empty((0, 2))
             return []
 
+        # Convert raw scan data (angle, distance) to world coordinates (x, y)
         world_scan_points = [
             self.convert_polar_to_cartesian(angle, dist, self.x, self.y, self.theta)
             for angle, dist in self.raw_scan_data
-            if dist <= self.radar_max_distance + self.radar_noise_std * 3
+            # Filter points again just in case (should be filtered by scan_environment)
+            if dist <= self.radar_max_distance
         ]
         # Store points for plotting
         self.scan_points_for_plot = np.array(world_scan_points)
 
+        # If not enough points for minimum samples, return empty list of centers
         if self.scan_points_for_plot.shape[0] < self.dbscan_min_samples:
             return []
 
+        # Perform DBSCAN clustering on the world coordinates
         dbscan = DBSCAN(eps=self.dbscan_eps, min_samples=self.dbscan_min_samples)
         clusters = dbscan.fit_predict(self.scan_points_for_plot)
 
         clustered_points_map = {}
         for i, label in enumerate(clusters):
-            if label != -1:
+            if label != -1: # Ignore noise points (-1)
                 if label not in clustered_points_map:
                     clustered_points_map[label] = []
                 clustered_points_map[label].append(self.scan_points_for_plot[i])
 
         obstacle_centers = []
+        # Calculate the centroid for each cluster
         for label, points in clustered_points_map.items():
             center = np.mean(points, axis=0)
             obstacle_centers.append(center)
 
         return obstacle_centers
 
+
     def track_obstacles(self, current_obstacle_centers, dt):
         """跟踪障碍物，并更新历史位置。使用匈牙利算法匹配当前检测到的中心与已知障碍物。"""
         # Tracks obstacles and updates historical positions. Uses the Hungarian algorithm to match current detected centers with known obstacles.
-        if not current_obstacle_centers:
-            new_obstacle_clusters = []
-            for cluster in self.obstacle_clusters:
-                cluster.setdefault('age', 0)
-                cluster['age'] += 1
-                if cluster['age'] < 5:
-                    new_obstacle_clusters.append(cluster)
-                else:
-                    if cluster['id'] in self.obstacle_history:
-                        del self.obstacle_history[cluster['id']]
-            self.obstacle_clusters = new_obstacle_clusters
-            return
-
-        if not self.obstacle_clusters:
-            for center in current_obstacle_centers:
-                existing_ids = list(self.obstacle_history.keys())
-                new_id = max(existing_ids + [-1]) + 1 if existing_ids else 0
-                new_cluster = {'id': new_id, 'center': center, 'age': 0}
-                self.obstacle_clusters.append(new_cluster)
-                # Store history
-                self.obstacle_history[new_id] = [center]
-            return
-
         num_tracked = len(self.obstacle_clusters)
         num_detected = len(current_obstacle_centers)
+
+        # Build cost matrix for matching: Distance between tracked centers and detected centers
         cost_matrix = np.full((num_tracked, num_detected), np.inf)
 
-        # Threshold calculation: Max distance an object *could* move based on max speed + clustering noise + margin
+        # Threshold calculation: Max distance an object *could* move between frames + margin
         # Use actual frame dt for tracking threshold
         max_possible_movement = self.max_expected_obstacle_speed * dt
-        # Added fixed margin for robustness
-        match_threshold = max_possible_movement + self.obstacle_visual_radius * 2 + 0.5
+        # Add margin for robustness due to tracking imperfections, clustering noise, and potential small jitters
+        match_threshold = max_possible_movement + self.dbscan_eps * 1.5 # Example margin based on DBSCAN epsilon
+
 
         for i in range(num_tracked):
             for j in range(num_detected):
-                dist = np.linalg.norm(self.obstacle_clusters[i]['center'] - current_obstacle_centers[j])
+                dist = np.linalg.norm(np.array(self.obstacle_clusters[i]['center']) - np.array(current_obstacle_centers[j]))
+                # Only consider potential matches within the threshold distance
                 if dist < match_threshold:
-                    cost_matrix[i, j] = dist
-
-        try:
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        except ValueError as e:
-            print(f"Warning: Cost matrix infeasible in track_obstacles: {e}. Aging existing tracks.")
-            for cluster in self.obstacle_clusters:
-                cluster.setdefault('age', 0)
-                cluster['age'] += 1
-            new_obstacle_clusters = [c for c in self.obstacle_clusters if c['age'] < 5]
-            removed_ids = {c['id'] for c in self.obstacle_clusters if c not in new_obstacle_clusters}
-            for obj_id in removed_ids:
-                if obj_id in self.obstacle_history:
-                    del self.obstacle_history[obj_id]
-            self.obstacle_clusters = new_obstacle_clusters
-            return
+                    cost_matrix[i, j] = dist # Use distance as cost
 
         updated_clusters = []
-        matched_detected_indices = set(col_ind)
-        matched_tracked_indices = set(row_ind)
+        matched_detected_indices = set() # Indices of detected centers that found a match
+        matched_tracked_indices = set() # Indices of tracked clusters that found a match
 
-        for i, j in zip(row_ind, col_ind):
-            if cost_matrix[i, j] < np.inf:
-                tracked_cluster = self.obstacle_clusters[i]
-                detected_center = current_obstacle_centers[j]
+        if num_tracked > 0 and num_detected > 0:
+            try:
+                # Solve the assignment problem (Hungarian algorithm)
+                row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-                tracked_cluster['center'] = detected_center
-                tracked_cluster['age'] = 0
+                # Process matched pairs
+                for i, j in zip(row_ind, col_ind):
+                    # Check if the match is valid (cost < infinity, meaning it was within threshold)
+                    if cost_matrix[i, j] < np.inf:
+                        tracked_cluster = self.obstacle_clusters[i]
+                        detected_center = current_obstacle_centers[j]
 
-                obstacle_id = tracked_cluster['id']
-                if obstacle_id not in self.obstacle_history:
-                    self.obstacle_history[obstacle_id] = []
-                # Store history
-                self.obstacle_history[obstacle_id].append(detected_center)
-                if len(self.obstacle_history[obstacle_id]) > self.max_history_length:
-                    self.obstacle_history[obstacle_id].pop(0)
-                updated_clusters.append(tracked_cluster)
+                        # Update tracked cluster's center to the new detected position and reset age
+                        tracked_cluster['center'] = detected_center
+                        tracked_cluster['age'] = 0
 
-        # Handle new obstacles (detected but not matched to tracked)
+                        obstacle_id = tracked_cluster['id']
+                        # Update history for velocity estimation
+                        if obstacle_id not in self.obstacle_history:
+                            self.obstacle_history[obstacle_id] = []
+                        self.obstacle_history[obstacle_id].append(detected_center)
+                        # Keep history length limited
+                        if len(self.obstacle_history[obstacle_id]) > self.max_history_length:
+                            self.obstacle_history[obstacle_id].pop(0) # Remove the oldest entry
+
+                        updated_clusters.append(tracked_cluster)
+                        matched_tracked_indices.add(i)
+                        matched_detected_indices.add(j)
+
+            except ValueError as e:
+                # This can occur if the cost matrix contains no finite values (e.g., all distances > match_threshold)
+                # or if the matrix dimensions are invalid.
+                # print(f"Warning: linear_sum_assignment failed: {e}. Processing unmatched clusters/detections directly.")
+                pass # Handle unmatched processing below
+
+
+        # Handle new obstacles (detected but not matched to any tracked cluster)
         for j in range(num_detected):
             if j not in matched_detected_indices:
                 new_center = current_obstacle_centers[j]
-                existing_ids = list(self.obstacle_history.keys())
+                # Assign a new unique ID
+                existing_ids = list(self.obstacle_history.keys()) # Look through all history keys, even for aged-out ones, to avoid ID reuse
                 new_id = max(existing_ids + [-1]) + 1 if existing_ids else 0
                 new_cluster = {'id': new_id, 'center': new_center, 'age': 0}
                 updated_clusters.append(new_cluster)
-                # Store history
+                # Start history for the new obstacle
                 self.obstacle_history[new_id] = [new_center]
 
-        # Handle lost obstacles (tracked but not matched to detected)
+
+        # Handle lost obstacles (tracked but not matched to any detected center)
+        # Age the tracked clusters that were not matched
         for i in range(num_tracked):
             if i not in matched_tracked_indices:
                 lost_cluster = self.obstacle_clusters[i]
-                lost_cluster.setdefault('age', 0)
+                lost_cluster.setdefault('age', 0) # Ensure 'age' key exists
                 lost_cluster['age'] += 1
-                if lost_cluster['age'] < 5:
+                # Keep the cluster for a few frames even if not detected, using its last known position
+                if lost_cluster['age'] < 5: # Age threshold (e.g., 5 frames)
+                    # Append the aged cluster with its last known position
                     updated_clusters.append(lost_cluster)
                 else:
+                    # If too old, remove from active tracking and history
                     if lost_cluster['id'] in self.obstacle_history:
-                        del self.obstacle_history[lost_cluster['id']]
+                        del self.obstacle_history[lost_cluster['id']] # Remove history for this ID
 
+        # Update the list of currently tracked obstacles
         self.obstacle_clusters = updated_clusters
 
+
     def predict_obstacle_positions(self):
-        """根据历史位置预测障碍物在MPC预测步数后的位置。"""
-        # Predicts obstacle positions over the MPC prediction horizon based on historical positions.
-        predicted_positions = []
+        """根据历史位置预测障碍物在MPC预测步数内的路径。返回 list of [pos_t0, pos_t1, ..., pos_tN] for each obstacle."""
+        # Predicts obstacle paths over the MPC prediction horizon based on historical positions. Returns list of paths.
+        # Each path is a list of positions: [pos_at_t, pos_at_t+dt, ..., pos_at_t+N*dt]
+        predicted_obstacle_paths = []
 
         for cluster in self.obstacle_clusters:
             obstacle_id = cluster['id']
-            # Only predict if we have enough history
+            current_pos = np.array(cluster['center'])
+            # Start path with the current detected position of the obstacle
+            predicted_path = [current_pos.tolist()]
+
+            # Default velocity is zero (stationary prediction)
+            velocity_estimate = np.array([0.0, 0.0])
+
+            # Estimate velocity if enough history exists (at least 2 points)
             if obstacle_id in self.obstacle_history and len(self.obstacle_history[obstacle_id]) >= 2:
                 history = self.obstacle_history[obstacle_id]
-                pos_current = np.array(history[-1]) # Ensure it's a numpy array for calculations
-                pos_prev = np.array(history[-2]) # Ensure it's a numpy array for calculations
+                # Use the last two points in history to estimate velocity
+                pos_latest = np.array(history[-1])
+                pos_previous = np.array(history[-2])
 
-                # Velocity estimate using the last two points
-                # We don't have exact time stamps for history points, assume average frame dt or MPC dt
-                # Using MPC dt for consistency with prediction horizon calculation
-                time_diff_approx = self.dt # Assuming history points are approx MPC dt apart
+                # Approximate time difference between the last two history points.
+                # Using MPC dt here simplifies prediction steps later.
+                # A more accurate approach would use timestamps if available.
+                history_time_diff_approx = self.dt # Assume history points are roughly MPC dt apart
 
-                if time_diff_approx > 1e-6:
-                    velocity_estimate = (pos_current - pos_prev) / time_diff_approx
-                else:
-                    velocity_estimate = np.array([0.0, 0.0])
+                if history_time_diff_approx > 1e-9: # Avoid division by near-zero
+                    velocity_estimate = (pos_latest - pos_previous) / history_time_diff_approx
 
+                # Cap estimated speed to a reasonable maximum to avoid prediction errors from noisy data
                 current_est_speed = np.linalg.norm(velocity_estimate)
-                # Cap estimated speed to a reasonable maximum
                 if current_est_speed > self.max_expected_obstacle_speed:
-                    # Avoid division by zero if speed is zero
                     if current_est_speed > 1e-9:
                         velocity_estimate = (velocity_estimate / current_est_speed) * self.max_expected_obstacle_speed
                     else:
-                        velocity_estimate = np.array([0.0, 0.0]) # Already zero
+                        velocity_estimate = np.array([0.0, 0.0]) # Speed is zero, capping does nothing
 
-                # Predict future position over the MPC horizon (N steps of MPC dt)
-                predicted_pos = pos_current + velocity_estimate * (self.prediction_horizon * self.dt)
-                predicted_positions.append(predicted_pos)
-            else:
-                # Assume stationary if history is insufficient
-                predicted_positions.append(np.array(cluster['center'])) # Ensure it's a numpy array
+            # Predict positions for each step in the MPC horizon (from step 1 to N)
+            current_predicted_pos = current_pos.copy() # Start prediction from current tracked position
+            for i in range(self.prediction_horizon):
+                # Predict next position assuming constant velocity over the MPC dt step
+                current_predicted_pos = current_predicted_pos + velocity_estimate * self.dt
+                predicted_path.append(current_predicted_pos.tolist()) # Add position at t + (i+1)*dt
 
-        return predicted_positions
+            predicted_obstacle_paths.append(predicted_path)
+
+        return predicted_obstacle_paths
+
 
     def motion_model(self, state, control, dt):
         """车辆运动模型：state = [x, y, vx, vy]. control = [ax_control, ay_control]. 包含基于当前速度的阻力项。"""
         # Vehicle motion model: state = [x, y, vx, vy]. control = [ax_control, ay_control]. Includes a velocity-dependent resistance term.
         # state = [x, y, vx, vy]
-        # control = [ax_control, ay_control] - This is the *control* acceleration from the optimizer
+        # control = [ax_control, ay_control] - This is the *control* acceleration commanded by the optimizer
 
         x, y, vx, vy = state
         ax_control, ay_control = control
@@ -621,16 +669,17 @@ class CarController:
         # *** 计算阻力加速度 ***
         # *** Calculate Resistance Acceleration ***
         # Resistance force is proportional to velocity and opposite direction: F_res = -k * v
-        # Resistance acceleration is F_res / mass. Assuming mass = 1 or k incorporates mass: a_res = -resistance_coeff * v
+        # Assuming mass=1 for simplicity, acceleration_res = -k * v
         ax_resistance = -self.resistance_coeff * vx
         ay_resistance = -self.resistance_coeff * vy
 
         # *** 计算净加速度 ***
         # *** Calculate Net Acceleration ***
+        # Net acceleration is the sum of control acceleration and resistance acceleration
         net_ax = ax_control + ax_resistance
         net_ay = ay_control + ay_resistance
 
-        # Update velocity using net acceleration
+        # Update velocity using net acceleration and the given time step dt
         next_vx = vx + net_ax * dt
         next_vy = vy + net_ay * dt
 
@@ -638,127 +687,168 @@ class CarController:
         current_speed_sq = next_vx**2 + next_vy**2
         max_speed_sq = self.max_speed**2
         if current_speed_sq > max_speed_sq:
-            # Avoid division by zero if speed is near zero
-            if current_speed_sq > 1e-9:
+            # Scale velocity vector down to max_speed magnitude
+            if current_speed_sq > 1e-12: # Avoid division by near zero
                 scale = self.max_speed / math.sqrt(current_speed_sq)
                 next_vx *= scale
                 next_vy *= scale
-            else:
-                # Speed is zero, no scaling needed
+            else: # Speed is zero or near zero, no scaling needed
                 next_vx = 0.0
                 next_vy = 0.0
 
-        # Update position using the new (potentially limited) velocity
+        # Update position using the new (potentially limited) velocity and the given time step dt
         next_x = x + next_vx * dt
         next_y = y + next_vy * dt
 
         return np.array([next_x, next_y, next_vx, next_vy])
 
+
     def calculate_blend_ratio(self, dist_to_nearest_obstacle):
         """Calculates blend ratio (alpha) between avoidance (1) and manual (0)."""
+        # If no obstacles are tracked or the nearest is far away, pure manual/goal control (alpha=0)
         if dist_to_nearest_obstacle is None or dist_to_nearest_obstacle >= self.manual_override_dist:
             return 0.0
+        # If an obstacle is very close, pure avoidance control (alpha=1)
         if dist_to_nearest_obstacle <= self.blend_safe_dist:
             return 1.0
 
+        # In the transition zone, blend linearly based on the distance
         range_dist = self.manual_override_dist - self.blend_safe_dist
-        if range_dist <= 1e-9:
+        if range_dist <= 1e-9: # Avoid division by zero if the range is tiny
             return 1.0 if dist_to_nearest_obstacle <= self.blend_safe_dist else 0.0
 
+        # Clamp distance within the blending range for calculation
         clamped_dist = np.clip(dist_to_nearest_obstacle, self.blend_safe_dist, self.manual_override_dist)
-        # Smooth transition (e.g., linear)
+
+        # Calculate alpha: 1 at blend_safe_dist, 0 at manual_override_dist
+        # This formula maps [blend_safe_dist, manual_override_dist] to [1, 0]
         alpha = (self.manual_override_dist - clamped_dist) / range_dist
 
+        # Ensure alpha is strictly between 0 and 1 (although clip should handle this)
         return np.clip(alpha, 0.0, 1.0)
 
-    def mpc_cost(self, u_flat, x0, goal, predicted_obstacles):
+
+    def mpc_cost(self, u_flat, x0, goal, predicted_obstacle_paths):
         """MPC 优化目标函数。u_flat是展平的控制输入 [ax0, ay0, ax1, ay1, ...]."""
         # MPC objective function. u_flat is the flattened control input [ax0, ay0, ax1, ay1, ...].
         # u_flat: Control sequence [ax0, ay0, ax1, ay1, ...] from the optimizer (represents *control* acceleration, not net)
         # x0: initial state [x, y, vx, vy]
         # goal: target position [gx, gy] (numpy array or None)
-        # predicted_obstacles: list of predicted obstacle positions [ox, oy] (numpy arrays) over the horizon
-        # blend_alpha: Current blend ratio calculated in update_frame (1=avoidance, 0=manual/goal) - Accessed via self.blend_alpha
+        # predicted_obstacle_paths: list of paths, where each path is a list of predicted positions for each MPC step:
+        #   [[pos_obs0_t0, pos_obs0_t1, ..., pos_obs0_tN], [pos_obs1_t0, pos_obs1_t1, ..., pos_obs1_tN], ...]
+        # blend_alpha: Current blend ratio (1=avoidance, 0=manual/goal) - Accessed via self.blend_alpha
 
         cost = 0.0
-        state = np.array(x0) # Start from current state
+        state = np.array(x0) # Current state at the start of the horizon
 
         # Store MPC predicted path for visualization
+        # The trajectory starts from the current car position (x0[:2])
         self.mpc_trajectory = [state[:2].tolist()]
 
         alpha = self.blend_alpha # Get the current blend ratio
 
-        # Adjusted weights based on blend_alpha
-        # Obstacle cost is fully weighted when alpha=1, zero when alpha=0
+        # Scale weights based on the blending ratio
+        # Obstacle cost is prioritized when alpha is high
         obstacle_cost_weight_scaled = alpha * self.weight_obstacle
-        # Goal/Manual cost is zero when alpha=1, fully weighted when alpha=0
-        goal_or_manual_weight_scaled = (1.0 - alpha) * (self.weight_goal if goal is not None else self.weight_velocity) # Apply base weight here
+        # Goal/Manual cost is prioritized when alpha is low
+        # Use goal weight if a goal is set, otherwise use velocity weight for manual control
+        goal_or_manual_weight_scaled = (1.0 - alpha) * (self.weight_goal if goal is not None else self.weight_velocity)
 
+
+        # Iterate through each step in the MPC prediction horizon
         for i in range(self.prediction_horizon):
-            # Extract *control* acceleration for this step [ax_i, ay_i] from the optimizer's output
-            # This is the acceleration the optimizer *commands*, before resistance is applied
-            if (i * 2 + 1) >= len(u_flat):
-                # print(f"Warning: u_flat index out of bounds at step {i}. Expected length {self.prediction_horizon*2}, got {len(u_flat)}.")
-                break
+            # Extract *control* acceleration for the current step (i) from the optimizer's flattened input
+            # Ensure indices are within the bounds of u_flat
+            if (i * 2 + 1) < len(u_flat):
+                control_i = np.array([u_flat[i * 2], u_flat[i * 2 + 1]])
+            else:
+                # Fallback to zero control if u_flat is shorter than expected (shouldn't happen with correct bounds/u0 size)
+                control_i = np.array([0.0, 0.0])
+                # print(f"Warning: u_flat index out of bounds at step {i}. Using zero control.")
 
-            control_i = np.array([u_flat[i * 2], u_flat[i * 2 + 1]])
 
-            # Predict next state using the motion model, which *includes* resistance
-            # The motion model takes the *control* input [ax_i, ay_i] and the current state [x, y, vx, vy]
-            # and calculates the next state considering *both* control and resistance.
+            # Predict the next state of the car using the motion model and the control input for this step
+            # The motion model includes the effect of resistance.
+            # The state `state` is updated iteratively for each step.
             state = self.motion_model(state, control_i, self.dt)
-            x, y, vx, vy = state
+            x, y, vx, vy = state # Unpack the state for easier access
 
-            # Add predicted state to trajectory for visualization
+            # Add the predicted position (x, y) at this step to the trajectory for visualization
             self.mpc_trajectory.append(state[:2].tolist())
 
-            # --- Cost Calculation ---
+            # --- Calculate Cost for this step ---
 
-            # 1. Goal/Manual Cost (Weighted by 1-alpha)
+            # 1. Goal/Manual Control Cost (Weighted by 1-alpha)
             goal_or_manual_cost_step = 0.0
             if goal is not None:
+                # If a goal is set, penalize distance to the goal (which is static)
                 dist_to_goal = np.linalg.norm(state[:2] - goal)
-                # Apply (1-alpha) scaling to the base goal weight
-                goal_or_manual_cost_step = dist_to_goal**2 # Weight applied outside loop step
+                goal_or_manual_cost_step = dist_to_goal**2 # Quadratic penalty for distance
             else:
-                # Penalize deviation from desired manual velocity (weighted by 1-alpha)
-                desired_velocity = self.control_vector * self.max_speed # Desired velocity based on manual input
-                velocity_error_sq = np.sum((state[2:] - desired_velocity)**2)
-                # Apply (1-alpha) scaling to the base velocity weight
-                goal_or_manual_cost_step = velocity_error_sq # Weight applied outside loop step
+                # If no goal is set, penalize deviation from the desired manual velocity
+                desired_velocity = self.control_vector * self.max_speed # Desired velocity vector
+                velocity_error_sq = np.sum((state[2:] - desired_velocity)**2) # Squared error in velocity vector components
+                goal_or_manual_cost_step = velocity_error_sq # Quadratic penalty for velocity error
 
-            cost += goal_or_manual_weight_scaled * goal_or_manual_cost_step # Apply combined goal/manual scaled weight
+            # Add the scaled goal/manual cost for this step to the total cost
+            cost += goal_or_manual_weight_scaled * goal_or_manual_cost_step
+
 
             # 2. Control Effort Cost (Standard weight)
-            # Penalize the *control* acceleration commanded by the optimizer
-            cost += self.weight_accel * np.sum(control_i**2)
+            # Penalize the magnitude of the *control* acceleration commanded by the optimizer
+            cost += self.weight_accel * np.sum(control_i**2) # Quadratic penalty on control effort
 
-            # 3. Obstacle Cost (Weighted by alpha)
+
+            # 3. Obstacle Avoidance Cost (Weighted by alpha)
             obstacle_cost_step = 0.0
-            # Only calculate if scaled weight is significant and there are predicted obstacles
-            if obstacle_cost_weight_scaled > 1e-9 and predicted_obstacles:
+            # Only calculate obstacle cost if the scaled weight is significant and there are obstacle paths
+            if obstacle_cost_weight_scaled > 1e-9 and predicted_obstacle_paths:
+                # Define safe and warning distances for obstacles
                 safe_distance = self.car_radius + self.obstacle_visual_radius + self.avoidance_margin
-                warning_zone = safe_distance + self.warning_zone_distance
+                warning_zone_dist_start = safe_distance # Warning starts right outside the safe zone
+                warning_zone_dist_end = safe_distance + self.warning_zone_distance # Warning ends at this distance
 
-                # predicted_obstacles is a list like [obs1_pos_t+Ndt, obs2_pos_t+Ndt, ...]
-                for obs_pos in predicted_obstacles:
-                    # Calculate distance between car's position at step i and obstacle's position at step N
-                    dist_to_obstacle = np.linalg.norm(state[:2] - obs_pos)
-                    if dist_to_obstacle < safe_distance:
-                        # Penalize collision/penetration
-                        penetration = safe_distance - dist_to_obstacle
-                        obstacle_cost_step += penetration**2
-                    elif dist_to_obstacle < warning_zone:
-                        # Penalize approaching the warning zone
-                        smoothness_factor = 0.5
-                        obstacle_cost_step += math.exp(-(dist_to_obstacle - safe_distance)/smoothness_factor)
 
-                # Apply the scaled obstacle weight
-                cost += obstacle_cost_weight_scaled * obstacle_cost_step
+                # Iterate through each obstacle's predicted path
+                # predicted_obstacle_paths[j][i] is the predicted position of obstacle j at time t + i*dt
+                for obs_path in predicted_obstacle_paths:
+                    # Ensure the obstacle path has a predicted position for this specific step 'i'
+                    if len(obs_path) > i:
+                        obs_pos_at_i = np.array(obs_path[i]) # Get obstacle position at time t + i*dt
 
-            # 4. Boundary Cost (Standard weight)
-            # Penalize getting too close to world boundaries
+                        # Calculate the distance between the car's predicted position and the obstacle's predicted position at time t + i*dt
+                        dist_to_obstacle = np.linalg.norm(state[:2] - obs_pos_at_i)
+
+                        if dist_to_obstacle < safe_distance:
+                            # High quadratic penalty for being inside or penetrating the safe distance (collision)
+                            penetration = safe_distance - dist_to_obstacle
+                            obstacle_cost_step += penetration**2 * 100 # Use a higher multiplier for collision
+
+                        elif dist_to_obstacle < warning_zone_dist_end:
+                            # Exponential penalty for being within the warning zone
+                            # Penalty is high near safe_distance and approaches 0 near warning_zone_dist_end
+                            # Penalty should be 0 when dist >= warning_zone_dist_end
+                            # Let's use a sigmoid or related function, or a carefully constructed exponential
+                            # A simple inverse distance penalty can also work: 1 / (dist - safe_distance) - 1 / (warning_zone_dist_end - safe_distance) when in range
+                            # Or, exp((safe_distance - dist)/k)
+                            # Let's refine the exponential penalty: exp(-(dist - safe_distance)/smoothing)
+                            # At dist = safe_distance, exp(0) = 1
+                            # At dist = warning_zone_dist_end = safe_distance + warning_zone_distance, exp(-warning_zone_distance/smoothing)
+                            # We want penalty to be significant near safe_distance and negligible near warning_zone_dist_end.
+                            # Use inverse exponential: penalty = exp((safe_distance - dist)/smoothing)
+                            smoothing_factor = self.warning_zone_distance / 3.0 # Adjust smoothing based on warning zone width
+                            obstacle_cost_step += math.exp((safe_distance - dist_to_obstacle) / smoothing_factor)
+                            # An offset might be needed if we want it strictly 0 at warning_zone_dist_end, but a small non-zero value is often acceptable.
+
+
+            # Add the scaled obstacle cost for this step to the total cost
+            cost += obstacle_cost_weight_scaled * obstacle_cost_step
+
+
+            # 4. Boundary Avoidance Cost (Standard weight)
+            # Penalize getting too close to the world boundaries
             boundary_cost_step = 0.0
+            # Calculate distance to each boundary
             dist_left = state[0] - (-self.world_size)
             dist_right = self.world_size - state[0]
             dist_bottom = state[1] - (-self.world_size)
@@ -766,6 +856,7 @@ class CarController:
 
             boundary_safe_distance = self.boundary_safe_distance
 
+            # Quadratic penalty if distance to a boundary is less than the safe distance
             if dist_left < boundary_safe_distance:
                 boundary_cost_step += (boundary_safe_distance - dist_left)**2
             if dist_right < boundary_safe_distance:
@@ -775,181 +866,224 @@ class CarController:
             if dist_top < boundary_safe_distance:
                 boundary_cost_step += (boundary_safe_distance - dist_top)**2
 
+            # Add the boundary cost for this step to the total cost
             cost += self.weight_boundary * boundary_cost_step
 
-        # self.mpc_trajectory is updated during the cost calculation loop
+        # The self.mpc_trajectory list is populated during the loop iterations
 
         return cost
 
-    def solve_mpc(self, x0, goal, predicted_obstacles):
+
+    def predict_obstacle_positions(self):
+        """根据历史位置预测障碍物在MPC预测步数内的路径。返回 list of [pos_t0, pos_t1, ..., pos_tN] for each obstacle."""
+        # Predicts obstacle paths over the MPC prediction horizon based on historical positions. Returns list of paths.
+        # Each path is a list of positions: [pos_at_t, pos_at_t+dt, pos_at_t+2*dt, ..., pos_at_t+N*dt]
+        predicted_obstacle_paths = []
+
+        for cluster in self.obstacle_clusters:
+            obstacle_id = cluster['id']
+            current_pos = np.array(cluster['center'])
+            # Start the predicted path with the obstacle's current tracked position
+            predicted_path = [current_pos.tolist()] # Position at time t (current time)
+
+            # Default prediction is stationary (zero velocity)
+            velocity_estimate = np.array([0.0, 0.0])
+
+            # Estimate velocity if enough history points are available (at least 2 points)
+            if obstacle_id in self.obstacle_history and len(self.obstacle_history[obstacle_id]) >= 2:
+                history = self.obstacle_history[obstacle_id]
+                # Use the two most recent history points to calculate a velocity vector
+                pos_latest = np.array(history[-1])
+                pos_previous = np.array(history[-2])
+
+                # Time difference between the last two history points.
+                # Using MPC dt here assumes tracking updates happen roughly aligned with MPC steps,
+                # or that MPC dt is used as the time unit for velocity scaling.
+                history_time_diff_approx = self.dt # Assume history points are approx MPC dt apart
+
+                if history_time_diff_approx > 1e-9: # Avoid division by near zero
+                    velocity_estimate = (pos_latest - pos_previous) / history_time_diff_approx
+
+                # Cap the estimated speed to a maximum value to prevent unrealistic predictions from noise or tracking errors
+                current_est_speed = np.linalg.norm(velocity_estimate)
+                if current_est_speed > self.max_expected_obstacle_speed:
+                    if current_est_speed > 1e-9: # Avoid division by zero
+                        velocity_estimate = (velocity_estimate / current_est_speed) * self.max_expected_obstacle_speed
+                    else:
+                        velocity_estimate = np.array([0.0, 0.0]) # Speed is zero
+
+            # Predict positions for each future time step in the MPC horizon (from step 1 to N)
+            current_predicted_pos = current_pos.copy() # Prediction starts from current position
+            for i in range(self.prediction_horizon):
+                # Predict the position at the next time step (t + (i+1)*dt) assuming constant velocity
+                current_predicted_pos = current_predicted_pos + velocity_estimate * self.dt
+                predicted_path.append(current_predicted_pos.tolist()) # Add position at t + (i+1)*dt
+
+            predicted_obstacle_paths.append(predicted_path)
+
+        return predicted_obstacle_paths
+
+
+    def solve_mpc(self, x0, goal, predicted_obstacle_paths):
         """求解 MPC 控制序列。"""
         # Solves for the MPC control sequence.
+        # x0: Current state [x, y, vx, vy]
+        # goal: Target position [gx, gy] or None
+        # predicted_obstacle_paths: List of predicted paths for obstacles over the MPC horizon
+
         effective_goal = np.array(goal) if goal is not None else None
-        # Initial guess for control inputs (zero acceleration)
-        u0 = np.zeros(self.prediction_horizon * 2)
-        # Bounds for control inputs (acceleration)
+        # Initial guess for control inputs (zero acceleration for all steps)
+        u0 = np.zeros(self.prediction_horizon * 2) # 2 control inputs (ax, ay) per step
+        # Bounds for control inputs (limit acceleration magnitude for each axis, for each step)
         bounds = [(-self.max_accel, self.max_accel), (-self.max_accel, self.max_accel)] * self.prediction_horizon
 
-        # Define the objective function for the optimizer
-        objective = lambda u_flat: self.mpc_cost(u_flat, x0, effective_goal, predicted_obstacles)
 
-        # Using 'bounds' implies the control [ax, ay] is constrained directly.
-        # The resistance is a separate force based on state (velocity).
+        # Define the objective function that the optimizer will minimize
+        # It takes the flattened control sequence u_flat and uses the other parameters (x0, goal, predicted_obstacle_paths)
+        # which are available from the CarController object instance.
+        objective = lambda u_flat: self.mpc_cost(u_flat, x0, effective_goal, predicted_obstacle_paths)
+
+        # Use scipy.optimize.minimize with the SLSQP method
+        # SLSQP supports bounds and is suitable for non-linear problems with constraints (though we only have bounds here)
         result = minimize(objective, u0,
-                          method='SLSQP', bounds=bounds,
-                          options={'maxiter': 50, 'ftol': 1e-2, 'disp': False})
+                          method='SLSQP',
+                          bounds=bounds,
+                          options={'maxiter': 200, 'ftol': 1e-2, 'disp': False}) # *** Using Increased maxiter ***
 
-        # mpc_cost already calculated and stored self.mpc_trajectory based on the states predicted using result.x
+        # The mpc_cost function (called by minimize) internally calculates and stores
+        # the predicted trajectory (self.mpc_trajectory) for the *final* set of control inputs found by the optimizer.
 
         if result.success:
+            # If optimization succeeded, return the optimal control sequence
             return result.x
         else:
-            # print("MPC Optimization failed:", result.message)
-            # Clear potentially bad prediction trajectory
+            # If optimization failed, print a warning (optional) and return zero control inputs.
+            # Returning zeros causes the vehicle to slow down due to resistance, effectively stopping it.
+            # print(f"MPC Optimization failed: {result.message}") # Uncomment for debugging
+            # Clear the MPC trajectory visualization as the planned path is not valid
             self.mpc_trajectory = []
-            # Return zero control if optimization fails
-            return np.zeros(self.prediction_horizon * 2)
+            return np.zeros(self.prediction_horizon * 2) # Return zero control for all steps
+
 
     def update_movement(self, dt):
         """使用MPC求解得到的控制量更新车辆状态。"""
         # Updates vehicle state using the control command obtained from the MPC solver.
-        # dt: actual time passed since last frame
+        # dt: actual time passed since the last frame (variable)
 
+        # Get the current state of the vehicle
         current_state = np.array([self.x, self.y, self.vx, self.vy])
-        # predicted_obstacle_positions_for_mpc holds obstacle positions predicted for the end of the horizon (t + N*dt)
-        predicted_obstacle_positions = getattr(self, 'predicted_obstacle_positions_for_mpc', [])
 
-        # solve_mpc calculates the optimal *control* acceleration [ax, ay] for each step
-        # and also sets self.mpc_trajectory based on the predicted states resulting from these *control* inputs
-        # combined with resistance in the motion model.
-        u_flat = self.solve_mpc(current_state, self.goal, predicted_obstacle_positions)
+        # Predict the paths of obstacles over the MPC horizon based on current tracking data
+        predicted_obstacle_paths = self.predict_obstacle_positions()
 
-        # Apply the first control command [ax0, ay0] from the optimized sequence
-        # This is the *commanded* acceleration, NOT the net acceleration
+        # Solve the MPC problem to get the optimal control sequence for the current state and predicted obstacles
+        # solve_mpc also updates self.mpc_trajectory internally
+        u_flat = self.solve_mpc(current_state, self.goal, predicted_obstacle_paths)
+
+        # Extract the *first* control command [ax0, ay0] from the optimized sequence
+        # This is the commanded acceleration to apply for the duration of the actual frame dt.
+        commanded_ax = 0.0
+        commanded_ay = 0.0
+
         if u_flat is not None and len(u_flat) >= 2:
             commanded_ax = u_flat[0]
             commanded_ay = u_flat[1]
+        # If u_flat is None or too short (e.g., solve_mpc failed and returned zeros), commanded_ax/ay remain 0.0
 
-            # *** Calculate resistance acceleration based on *current* velocity ***
-            # *** Calculate resistance acceleration based on *current* velocity ***
-            resistance_ax = -self.resistance_coeff * self.vx
-            resistance_ay = -self.resistance_coeff * self.vy
+        # Calculate the resistance acceleration based on the *current* velocity
+        resistance_ax = -self.resistance_coeff * self.vx
+        resistance_ay = -self.resistance_coeff * self.vy
 
-            # *** Calculate the net acceleration applied to the vehicle ***
-            # *** Calculate the net acceleration applied to the vehicle ***
-            net_ax = commanded_ax + resistance_ax
-            net_ay = commanded_ay + resistance_ay
+        # Calculate the net acceleration applied to the vehicle in this frame
+        # This is the sum of the commanded acceleration from MPC and the resistance acceleration
+        net_ax = commanded_ax + resistance_ax
+        net_ay = commanded_ay + resistance_ay
 
-            # Update velocity based on net acceleration and actual frame dt
-            self.vx += net_ax * dt
-            self.vy += net_ay * dt
+        # Update velocity based on the net acceleration and the actual frame time step dt
+        self.vx += net_ax * dt
+        self.vy += net_ay * dt
 
-            # Apply speed limit *after* net acceleration integration
-            current_speed = math.hypot(self.vx, self.vy)
-            if current_speed > self.max_speed:
-                # Should not happen if speed was within limit, but as safeguard
-                if current_speed > 1e-9:
-                    scale = self.max_speed / current_speed
-                    self.vx *= scale
-                    self.vy *= scale
-                else:
-                    # Avoid potential NaNs if scale was inf/nan
-                    self.vx = 0.0
-                    self.vy = 0.0
+        # Apply the speed limit *after* updating the velocity
+        current_speed = math.hypot(self.vx, self.vy)
+        if current_speed > self.max_speed:
+            # Scale the velocity vector back down to the maximum speed magnitude
+            if current_speed > 1e-12: # Avoid division by near zero
+                scale = self.max_speed / current_speed
+                self.vx *= scale
+                self.vy *= scale
+            else: # Speed is zero or near zero, set to zero explicitly to prevent NaNs
+                self.vx = 0.0
+                self.vy = 0.0
 
-            # Update scalar velocity display
-            self.velocity = math.hypot(self.vx, self.vy)
+        # Update the scalar velocity display variable
+        self.velocity = math.hypot(self.vx, self.vy)
 
-            # Update position based on the new velocity
-            self.x += self.vx * dt
-            self.y += self.vy * dt
+        # Update position based on the new velocity and the actual frame time step dt
+        self.x += self.vx * dt
+        self.y += self.vy * dt
 
-            # Store current position for trajectory
-            self.trajectory.append((self.x, self.y))
-            max_trajectory_length = 500
-            if len(self.trajectory) > max_trajectory_length:
-                self.trajectory.pop(0)
-
-        else:
-            # If optimization failed and returned zeros or None, just apply resistance.
-            # This effectively causes the vehicle to slow down.
-            resistance_ax = -self.resistance_coeff * self.vx
-            resistance_ay = -self.resistance_coeff * self.vy
-
-            self.vx += resistance_ax * dt
-            self.vy += resistance_ay * dt
-
-            # Apply speed limit even when only resistance is applied
-            current_speed = math.hypot(self.vx, self.vy)
-            if current_speed > self.max_speed:
-                # Should not happen if speed was within limit, but as safeguard
-                if current_speed > 1e-9:
-                    scale = self.max_speed / current_speed
-                    self.vx *= scale
-                    self.vy *= scale
-                else:
-                    self.vx = 0.0
-                    self.vy = 0.0
-
-            # Update scalar velocity display
-            self.velocity = math.hypot(self.vx, self.vy)
-
-            # Add position to trajectory even when stopping
-            self.trajectory.append((self.x, self.y))
-            max_trajectory_length = 500
-            if len(self.trajectory) > max_trajectory_length:
-                self.trajectory.pop(0)
-
-            # Clear MPC trajectory if optimization failed
-            # This is already handled inside solve_mpc on failure
-            self.mpc_trajectory = []
+        # Add the current position to the trajectory history for visualization
+        self.trajectory.append((self.x, self.y))
+        # Limit the length of the trajectory displayed
+        max_trajectory_length = 500
+        if len(self.trajectory) > max_trajectory_length:
+            self.trajectory.pop(0) # Remove the oldest position
 
 
     def check_collision(self, obstacle_positions):
         """碰撞检测：检查小车是否与提供的障碍物位置列表发生碰撞。"""
         # Collision detection: Checks if the car collides with the provided list of obstacle positions.
-        # Check against true obstacles for simulation realism.
+        # For simulation realism, we check against the *true* obstacle positions, not the tracked/predicted ones.
         car_pos = np.array([self.x, self.y])
-        # obstacle_positions argument is unused, check against true obstacles list
+        # The obstacle_positions argument is not used; we iterate through the true obstacles in self.obstacles
         for obstacle in self.obstacles:
             obs_pos = np.array(obstacle['circle'].center)
-            # Use the true radius
+            # Use the true radius of the obstacle for the collision check
             obs_radius = obstacle['true_radius']
-            collision_distance_sq = (self.car_radius + obs_radius)**2
-            dist_sq = np.sum((car_pos - obs_pos)**2)
-            if dist_sq < collision_distance_sq:
-                return True
-        return False
+            collision_distance = self.car_radius + obs_radius
+            dist = np.linalg.norm(car_pos - obs_pos)
+            if dist < collision_distance:
+                return True # Collision detected
+        return False # No collision detected
 
 
     def update_frame(self, frame=None):
         """主更新循环"""
-        # Main update loop
+        # Main update loop called by FuncAnimation for each frame
+
+        # --- Timing ---
         current_time = time.time()
-        dt = max(0.001, current_time - self._last_time)
+        # Calculate the actual time elapsed since the last frame
+        dt = max(0.001, current_time - self._last_time) # Ensure dt is not zero
         self._last_time = current_time
+        self._current_frame_dt = dt # Store for display
 
-        # Clamp max dt
-        dt = min(dt, 0.1)
+        # Clamp max dt to prevent simulation instability if a frame takes too long
+        dt = min(dt, 0.1) # e.g., simulate at most 10 FPS even if rendering is slower
 
-        # --- Simulation Updates ---
 
-        # Update true obstacle positions (for simulating the world)
+        # --- Simulation Updates (True World) ---
+        # Update the positions of the true obstacles in the simulation
         for obstacle in self.obstacles:
             if obstacle['motion_type'] == 'circle':
-                # Calculate linear distance moved along the circle circumference in dt
-                # Assuming 'speed' is linear speed along circumference for consistency
-                circumference = 2 * math.pi * obstacle['radius']
-                # Avoid division by zero if radius is zero
-                if circumference > 1e-9:
-                    # delta angle = linear_dist / radius
-                    angle_moved = (obstacle['speed'] * dt) / obstacle['radius']
-                    obstacle['angle'] = (obstacle['angle'] + angle_moved) % (2 * math.pi)
-                # If radius is zero, it's a point obstacle, assume stationary or handle differently.
-                # For now, if radius is zero, angle_moved will be inf or NaN, motion won't update, which is fine.
-                cx = obstacle['radius'] * math.cos(obstacle['angle'])
-                cy = obstacle['radius'] * math.sin(obstacle['angle'])
-                obstacle['circle'].center = (cx, cy)
+                cx_old, cy_old = obstacle['circle'].center
+                radius = obstacle['radius'] # Fixed radius from initialization
+
+                # If radius is non-zero, calculate angular speed and update angle
+                if radius > 1e-9:
+                    # Linear speed along circumference = radius * angular_speed (rad/s)
+                    # So, angular_speed = linear_speed / radius
+                    angular_speed_rad_per_sec = obstacle['speed'] / radius
+                    angle_moved = angular_speed_rad_per_sec * dt # Change in angle based on actual frame dt
+                    obstacle['angle'] = (obstacle['angle'] + angle_moved) % (2 * math.pi) # Update angle, wrap around 2*pi
+                    # Calculate new position based on updated angle and radius
+                    cx_new = radius * math.cos(obstacle['angle'])
+                    cy_new = radius * math.sin(obstacle['angle'])
+                    obstacle['circle'].center = (cx_new, cy_new)
+                else:
+                    # If radius is zero, the obstacle is fixed at the origin (0,0)
+                    obstacle['circle'].center = (0.0, 0.0)
+
 
             elif obstacle['motion_type'] == 'linear':
                 target = np.array(obstacle['target_pos'])
@@ -957,80 +1091,94 @@ class CarController:
                 direction = target - current
                 dist_to_target = np.linalg.norm(direction)
 
-                movement_this_step = obstacle['speed'] * dt
+                movement_this_step = obstacle['speed'] * dt # Distance to move based on actual frame dt
 
-                # If target reached or almost reached, pick a new target
-                if dist_to_target < max(movement_this_step * 0.5, 0.05):
+                # If the obstacle has reached or almost reached its target
+                if dist_to_target < max(movement_this_step * 0.5, 0.05): # Check if remaining distance is less than half a step or a small threshold
+                    # Set position exactly at the target to avoid overshooting
                     cx, cy = target
+                    obstacle['circle'].center = (cx, cy)
+                    # Pick a new random target position within the world bounds, respecting obstacle radius
                     obs_radius = obstacle['true_radius']
                     new_target_x = random.uniform(-self.world_size + obs_radius, self.world_size - obs_radius)
                     new_target_y = random.uniform(-self.world_size + obs_radius, self.world_size - obs_radius)
                     obstacle['target_pos'] = (new_target_x, new_target_y)
-                    obstacle['circle'].center = (cx, cy)
+                    # print(f"Obstacle {obstacle['id']} reached target, setting new target: {obstacle['target_pos']}") # Debug print
                 else:
-                    # If target not reached, move towards target
-                    # Avoid division by zero if distance is zero
-                    if dist_to_target > 1e-9:
+                    # If target not reached, move towards the target
+                    if dist_to_target > 1e-9: # Avoid division by near zero
+                        # Calculate movement vector
                         move_vec = direction / dist_to_target * movement_this_step
+                        # Update position
                         cx, cy = current + move_vec
                         obstacle['circle'].center = (cx, cy)
-                    pass # Obstacle is already at the target, no movement
+                    # If dist_to_target is zero, current position is already the target, no movement needed this step
+
 
         # --- Perception and Tracking ---
+        # Simulate the radar scan from the car's current position, detecting true obstacles
         self.scan_environment()
+        # Process the raw scan data: convert to world points and cluster them to identify obstacle centers
         current_obstacle_centers_world = self.cluster_scan_points()
-        # Pass actual frame dt
+        # Track the identified obstacle centers over time, updating obstacle_clusters and obstacle_history
         self.track_obstacles(current_obstacle_centers_world, dt)
-        # predicted_obstacle_positions_for_mpc are positions at the end of the horizon (t + N*dt)
-        self.predicted_obstacle_positions_for_mpc = self.predict_obstacle_positions()
+        # Prediction of obstacle paths for MPC is done *inside* update_movement
 
         # --- Blend Calculation ---
+        # Calculate the distance from the car to the nearest currently *tracked* obstacle
         car_pos_np = np.array([self.x, self.y])
-        d_min = float('inf')
-        # Check if there are any tracked clusters
+        d_min = float('inf') # Initialize min distance to infinity
+        # If there are any currently tracked obstacle clusters
         if self.obstacle_clusters:
-            current_tracked_centers = [c['center'] for c in self.obstacle_clusters]
-            # If there are clusters, find minimum distance
-            if current_tracked_centers:
-                distances = [np.linalg.norm(car_pos_np - center) for center in current_tracked_centers]
-                d_min = min(distances)
-            else:
-                # If clusters list is empty (e.g., just cleared), set distance to inf
-                d_min = float('inf')
-        else:
-            # If no clusters, distance is infinite
-            d_min = float('inf')
+            # Calculate the distance from the car's position to the center of each tracked obstacle
+            distances = [np.linalg.norm(car_pos_np - np.array(c['center'])) for c in self.obstacle_clusters]
+            if distances: # Check if the list of distances is not empty
+                d_min = min(distances) # Find the minimum distance
 
+        # Calculate the blending ratio (alpha) based on the minimum distance to a tracked obstacle
+        # alpha=1 (pure avoidance) when close, alpha=0 (pure manual/goal) when far
         self.blend_alpha = self.calculate_blend_ratio(d_min)
 
+
         # --- Control and Movement ---
-        # Pass actual frame dt
+        # Update the car's state (position and velocity) using the MPC controller output
+        # The MPC solver is called internally by update_movement
         self.update_movement(dt)
 
+
         # --- Collision Check ---
-        # Check against true obstacles for simulation realism. obstacle_positions argument is unused
-        if self.check_collision(None):
+        # Check for collision between the car and the true obstacles *after* the movement update
+        # If a collision is detected
+        if self.check_collision(None): # The argument is ignored, checks against self.obstacles
+            # Stop the vehicle immediately
             self.vx = 0.0
             self.vy = 0.0
             self.velocity = 0.0
+            # Update info text to show collision status
             self.info_text.set_text("! COLLISION ! Speed Reset")
+            # Clear any active goal, as collision implies goal is likely no longer reachable or relevant
             self.goal = None
-            self.goal_marker.set_data([], [])
+            self.goal_marker.set_data([], []) # Hide the goal marker
             print("Collision detected! Vehicle stopped.")
+            # No further actions needed here like pausing, the animation loop continues but vehicle is stopped.
+
 
         else:
-            # Update info text
+            # If no collision, update the information text displayed on the plot
             info_str = f"Speed: {self.velocity:.1f} m/s (vx:{self.vx:.1f}, vy:{self.vy:.1f})\n" \
+                       f"Actual Frame dt: {self._current_frame_dt*1000:.1f} ms\n" \
                        f"Manual Direction: ({self.control_vector[0]:.1f}, {self.control_vector[1]:.1f})\n" \
-                       f"Nearest Obstacle: {d_min:.2f} m, MPC Blend Ratio (Avoidance/Total): {self.blend_alpha:.2f}"
+                       f"Nearest Obstacle (tracked): {d_min:.2f} m, MPC Blend Ratio (Avoidance): {self.blend_alpha:.2f}"
 
+            # Add information about the goal if one is set
             if self.goal:
                 car_pos_np = np.array([self.x, self.y])
                 goal_pos_np = np.array(self.goal)
                 dist_to_goal = np.linalg.norm(car_pos_np - goal_pos_np)
                 info_str += f"\nGoal: ({self.goal[0]:.1f}, {self.goal[1]:.1f}) Distance: {dist_to_goal:.1f} m"
-                # Check if goal is reached
-                if dist_to_goal < self.car_radius + 0.3: # Add a small tolerance for goal reaching
+                # Check if the goal has been reached
+                if dist_to_goal < self.car_radius + 0.5: # Use a small tolerance
+                    # Stop the vehicle upon reaching the goal
                     self.vx = 0.0
                     self.vy = 0.0
                     self.velocity = 0.0
@@ -1039,39 +1187,49 @@ class CarController:
                     info_str += "\nGoal Reached!"
                     print("Goal reached! Vehicle stopped.")
 
+            # Update the info text display
             self.info_text.set_text(info_str)
+
 
         # --- Graphics Updates ---
 
-        # Update car position
+        # Update the position of the car circle graphic
         self.car_circle.center = (self.x, self.y)
 
-        # Update radar scan points scatter plot
+        # Update the scatter plot for radar scan points
+        # Ensure scan_points_for_plot is a valid numpy array before updating
         if hasattr(self, 'scan_points_for_plot') and isinstance(self.scan_points_for_plot, np.ndarray) and self.scan_points_for_plot.ndim == 2 and self.scan_points_for_plot.shape[1] == 2:
             self.scan_scatter.set_offsets(self.scan_points_for_plot)
         else:
+            # If no points or invalid data, clear the scatter plot data
             self.scan_scatter.set_offsets(np.empty((0, 2)))
 
-        # Update vehicle trajectory line
+
+        # Update the vehicle trajectory line plot
         if self.trajectory:
             traj_np = np.array(self.trajectory)
             self.trajectory_line.set_data(traj_np[:, 0], traj_np[:, 1])
         else:
-            self.trajectory_line.set_data([], [])
+            self.trajectory_line.set_data([], []) # Clear line if trajectory is empty
 
-        # Update MPC predicted trajectory line
+
+        # Update the MPC predicted trajectory line plot
         # self.mpc_trajectory is updated inside mpc_cost or cleared in solve_mpc on failure
         if hasattr(self, 'mpc_trajectory') and self.mpc_trajectory:
             if len(self.mpc_trajectory) > 0:
                 mpc_traj_np = np.array(self.mpc_trajectory)
                 self.mpc_trajectory_line.set_data(mpc_traj_np[:, 0], mpc_traj_np[:, 1])
             else:
-                self.mpc_trajectory_line.set_data([], []) # Clear if list is empty
+                self.mpc_trajectory_line.set_data([], []) # Clear line if the list is empty
         else:
-            self.mpc_trajectory_line.set_data([], []) # Clear if attribute doesn't exist or is None
+            self.mpc_trajectory_line.set_data([], []) # Clear line if the attribute is missing or None
 
-        # Redraw canvas
-        self.fig.canvas.draw_idle()
+
+        # The positions of the true obstacle patches are updated directly on the patch objects earlier in the frame.
+
+        # Redraw the canvas - FuncAnimation with blit=False handles this automatically.
+        # self.fig.canvas.draw_idle() # Not strictly needed with blit=False, but harmless
+
 
     def show(self):
         """显示matplotlib窗口并启动动画"""
